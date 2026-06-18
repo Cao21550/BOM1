@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+*.log
+.cache/
+tests/.tmp/
+_pytest_tmp_run/
+.DS_Store
+samples/*_completed*
+samples/output*
+samples/*_query_tasks.csv
