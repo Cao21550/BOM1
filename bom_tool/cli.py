@@ -56,6 +56,12 @@ def main() -> int:
         action="store_true",
         help="Speed up .xlsx export by skipping copied cell styles for appended data",
     )
+    parser.add_argument(
+        "--lcsc-interval",
+        type=float,
+        default=1.2,
+        help="LCSC rate limiter interval in seconds. Lower = faster but may trigger anti-bot (default 1.2)",
+    )
     args = parser.parse_args()
 
     config = BomPipelineConfig(
@@ -72,7 +78,7 @@ def main() -> int:
         cache_ttl_hours=args.cache_ttl_hours,
         preserve_excel_styles=not args.fast_xlsx,
     )
-    pipeline = BomPipeline(create_adapters(args.supplier or ["lcsc"]))
+    pipeline = BomPipeline(create_adapters(args.supplier or ["lcsc"], lcsc_interval=args.lcsc_interval))
 
     def report(progress: TaskProgress) -> None:
         print(

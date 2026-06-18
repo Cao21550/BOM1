@@ -16,6 +16,16 @@ from bom_tool.utils import AsyncRateLimiter
 # Maximum seconds to wait for a single exponential-backoff step
 _RATE_LIMIT_RETRY_CAP = 120.0
 _SEARCH_URL_TEMPLATE = "https://so.szlcsc.com/global.html?k={keyword}"
+_HTML_CLIENT_MAX_REQUESTS = 3  # Recreate client after this many requests to avoid Akamai profiling
+_HTML_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://www.szlcsc.com/",
+}
 
 
 class LcscAdapter(BaseSupplierAdapter):
@@ -64,6 +74,8 @@ class LcscAdapter(BaseSupplierAdapter):
         self._rate_limiter = AsyncRateLimiter(min_interval=min_interval)
         self._request_lock = asyncio.Lock()
         self._api_client: httpx.AsyncClient | None = None
+        self._html_client: httpx.AsyncClient | None = None
+        self._html_request_count: int = 0
         self.search_url = "https://so.szlcsc.com/global.html"
         self.api_search_url = "https://wmsc.lcsc.com/ftps/wm/search/global"
 
@@ -116,26 +128,17 @@ class LcscAdapter(BaseSupplierAdapter):
     # ── HTTP helpers ──────────────────────────────────────────────
 
     async def _fetch_html_payload(self, query: str) -> dict[str, Any]:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": "https://www.szlcsc.com/",
-        }
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
             if attempt > 1:
-                await asyncio.sleep(attempt * 4 + random.uniform(0.5, 1.5))
+                await asyncio.sleep(attempt * 2 + random.uniform(0.3, 0.8))
             try:
-                return await self._do_html_request(query, headers)
+                return await self._do_html_request(query)
             except RuntimeError as exc:
                 if "HTTP 429" in str(exc):
                     # Dedicated exponential-backoff series for rate limiting
-                    recovered = await self._retry_after_rate_limit(query, headers)
+                    recovered = await self._retry_after_rate_limit(query)
                     if recovered is not None:
                         return recovered
                 last_error = exc
@@ -144,22 +147,33 @@ class LcscAdapter(BaseSupplierAdapter):
 
         raise RuntimeError(f"html request failed after retries: {last_error!r}")
 
-    async def _do_html_request(self, query: str, headers: dict[str, str]) -> dict[str, Any]:
-        """Single HTML search request with a short-lived client."""
+    async def _do_html_request(self, query: str) -> dict[str, Any]:
+        """Single HTML search request with a persistent HTTP/1.1 client.
+
+        The client is reused across requests (connection keep-alive),
+        and periodically recreated to avoid Akamai behavioral profiling.
+        If the connection drops or returns a challenge page (Akamai),
+        the client is recreated and the request retried once.
+        """
         await self._rate_limiter.wait()
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            headers=headers,
-            http2=self.http2,
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
-        ) as client:
-            response = await client.get(self.search_url, params={"k": query})
+        client = self._get_html_client()
+        response = await self._do_http_get(client, query)
+
+        # Akamai challenge detection: challenge pages are ~10KB vs normal 80-140KB
+        if response.status_code == 200 and len(response.text) < 50000:
+            await self._recreate_html_client()
+            client = self._get_html_client()
+            response = await self._do_http_get(client, query)
 
         if response.status_code in {403, 429, 500, 502, 503, 504}:
             raise RuntimeError(f"html HTTP {response.status_code}")
 
         response.raise_for_status()
+        self._html_request_count += 1
+        if self._html_request_count >= _HTML_CLIENT_MAX_REQUESTS:
+            # Rotate proactively before next request
+            await self._recreate_html_client()
+
         match = re.search(
             r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
             response.text,
@@ -180,7 +194,6 @@ class LcscAdapter(BaseSupplierAdapter):
     async def _retry_after_rate_limit(
         self,
         query: str,
-        headers: dict[str, str],
     ) -> dict[str, Any] | None:
         """Exponential backoff retry series after HTTP 429.
 
@@ -190,7 +203,7 @@ class LcscAdapter(BaseSupplierAdapter):
             wait = min(_RATE_LIMIT_RETRY_CAP, 4 * (2**step)) + random.uniform(0.5, 1.5)
             await asyncio.sleep(wait)
             try:
-                return await self._do_html_request(query, headers)
+                return await self._do_html_request(query)
             except RuntimeError as exc:
                 if "HTTP 429" not in str(exc):
                     raise
@@ -522,7 +535,39 @@ class LcscAdapter(BaseSupplierAdapter):
             )
         return self._api_client
 
+    def _get_html_client(self) -> httpx.AsyncClient:
+        """Get or create the persistent HTTP/1.1 keep-alive client for HTML searches."""
+        if self._html_client is None:
+            self._html_client = httpx.AsyncClient(
+                timeout=self.timeout,
+                headers=_HTML_HEADERS,
+                http2=False,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=3, max_keepalive_connections=3),
+            )
+        return self._html_client
+
+    async def _do_http_get(self, client: httpx.AsyncClient, query: str) -> httpx.Response:
+        """Perform HTTP GET with transport error recovery."""
+        try:
+            return await client.get(self.search_url, params={"k": query})
+        except (httpx.RemoteProtocolError, httpx.ConnectError):
+            # Connection dropped — rotate and retry once
+            await self._recreate_html_client()
+            new_client = self._get_html_client()
+            return await new_client.get(self.search_url, params={"k": query})
+
+    async def _recreate_html_client(self) -> None:
+        """Close and recreate the HTML client (connection rotation)."""
+        if self._html_client is not None:
+            await self._html_client.aclose()
+        self._html_client = None
+        self._html_request_count = 0
+
     async def close(self) -> None:
         if self._api_client is not None:
             await self._api_client.aclose()
         self._api_client = None
+        if self._html_client is not None:
+            await self._html_client.aclose()
+        self._html_client = None

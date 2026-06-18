@@ -9,7 +9,7 @@ SUPPLIER_CHOICES = {
 }
 
 
-def create_adapters(names: list[str]) -> list[BaseSupplierAdapter]:
+def create_adapters(names: list[str], lcsc_interval: float = 1.2) -> list[BaseSupplierAdapter]:
     adapters: list[BaseSupplierAdapter] = []
     for name in names:
         normalized_name = name.strip().lower()
@@ -20,7 +20,7 @@ def create_adapters(names: list[str]) -> list[BaseSupplierAdapter]:
         elif normalized_name in {"lcsc", "立创", "立创商城"}:
             from bom_tool.adapters.lcsc_adapter import LcscAdapter
 
-            adapters.append(LcscAdapter())
+            adapters.append(LcscAdapter(min_interval=lcsc_interval))
         elif normalized_name in {"hqchip", "华秋", "华秋商城"}:
             from bom_tool.adapters.hqchip_adapter import HqchipAdapter
 

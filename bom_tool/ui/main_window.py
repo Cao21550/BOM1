@@ -105,6 +105,7 @@ class PipelineWorker(QObject):
         cache_ttl_hours: int,
         preserve_excel_styles: bool,
         retry_failed: bool,
+        lcsc_interval: float = 1.2,
     ) -> None:
         super().__init__()
         self.input_path = input_path
@@ -119,6 +120,7 @@ class PipelineWorker(QObject):
         self.cache_ttl_hours = cache_ttl_hours
         self.preserve_excel_styles = preserve_excel_styles
         self.retry_failed = retry_failed
+        self.lcsc_interval = lcsc_interval
         self._cancel_requested = False
         self._pause_requested = False
         self._last_progress_emit = 0.0
@@ -171,7 +173,7 @@ class PipelineWorker(QObject):
                 self.log_message.emit(example)
 
     async def _run_pipeline(self):
-        pipeline = BomPipeline(create_adapters(self.supplier_names))
+        pipeline = BomPipeline(create_adapters(self.supplier_names, lcsc_interval=self.lcsc_interval))
         config = BomPipelineConfig(
             input_path=self.input_path,
             output_path=self.output_path,
@@ -216,11 +218,12 @@ class PipelineWorker(QObject):
 class SingleQueryWorker(QObject):
     finished = Signal(bool, object, str)
 
-    def __init__(self, keyword: str, search_type: SearchType, supplier_names: list[str]) -> None:
+    def __init__(self, keyword: str, search_type: SearchType, supplier_names: list[str], lcsc_interval: float = 1.2) -> None:
         super().__init__()
         self.keyword = keyword
         self.search_type = search_type
         self.supplier_names = supplier_names
+        self.lcsc_interval = lcsc_interval
 
     @Slot()
     def run(self) -> None:
@@ -232,7 +235,7 @@ class SingleQueryWorker(QObject):
         self.finished.emit(True, results, "查询完成")
 
     async def _run_query(self) -> list[PartResult]:
-        adapters = create_adapters(self.supplier_names)
+        adapters = create_adapters(self.supplier_names, lcsc_interval=self.lcsc_interval)
         try:
             tasks = [
                 adapter.search_by_sku(self.keyword)
@@ -566,12 +569,15 @@ class MainWindow(QMainWindow):
         supplier_names = self._selected_suppliers(self.batch_supplier_checks)
         query_mode = self.query_mode_combo.currentData()
         retry_max_concurrent = 1
+        lcsc_interval = 1.2
         if "lcsc" in supplier_names and query_mode == "stable":
             max_concurrent = 1
+            lcsc_interval = 1.2
             self.log("查询模式：稳定优先，首轮并发 1，失败项串行补跑。")
         elif "lcsc" in supplier_names and query_mode == "fast":
             max_concurrent = 2
-            self.log("查询模式：速度优先，首轮并发 2，失败项串行补跑。")
+            lcsc_interval = 0.8
+            self.log("查询模式：速度优先，首轮并发 2，请求间隔 0.8s，失败项串行补跑。")
         else:
             max_concurrent = self.concurrent_spin.value()
 
@@ -593,6 +599,7 @@ class MainWindow(QMainWindow):
                 if retry_failed_override is None
                 else retry_failed_override
             ),
+            lcsc_interval=lcsc_interval,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -623,7 +630,9 @@ class MainWindow(QMainWindow):
         output_path = Path(output_text) if output_text else self._default_output_path(input_path)
         task_table_path = output_path.with_name(f"{output_path.stem}_query_tasks.csv")
         supplier_names = self._selected_suppliers(self.batch_supplier_checks)
-        pipeline = BomPipeline(create_adapters(supplier_names))
+        query_mode = self.query_mode_combo.currentData()
+        lcsc_interval = 0.8 if "lcsc" in supplier_names and query_mode == "fast" else 1.2
+        pipeline = BomPipeline(create_adapters(supplier_names, lcsc_interval=lcsc_interval))
         config = BomPipelineConfig(
             input_path=input_path,
             output_path=output_path,
@@ -662,6 +671,7 @@ class MainWindow(QMainWindow):
             keyword,
             SearchType(self.single_search_type_combo.currentData()),
             self._selected_suppliers(self.single_supplier_checks),
+            lcsc_interval=0.8,
         )
         self.single_worker.moveToThread(self.single_thread)
         self.single_thread.started.connect(self.single_worker.run)
