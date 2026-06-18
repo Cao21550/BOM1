@@ -7,7 +7,8 @@ import re
 from typing import Any
 from urllib.parse import quote_plus
 
-import httpx
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import CurlError
 
 from bom_tool.adapters.base_adapter import BaseSupplierAdapter
 from bom_tool.models import PartResult, PriceBreak, QueryStatus, SearchType
@@ -59,22 +60,20 @@ class LcscAdapter(BaseSupplierAdapter):
     def __init__(
         self,
         timeout: float = 15.0,
-        http2: bool = False,
-        min_interval: float = 1.2,
+        min_interval: float = 1.0,
         max_retries: int = 2,
         prefer_api: bool = False,
         use_api_fallback: bool = False,
     ) -> None:
         super().__init__("lcsc", cache_key="lcsc_html_v4")
         self.timeout = timeout
-        self.http2 = http2
         self.max_retries = max(1, max_retries)
         self.prefer_api = prefer_api
         self.use_api_fallback = use_api_fallback
         self._rate_limiter = AsyncRateLimiter(min_interval=min_interval)
         self._request_lock = asyncio.Lock()
-        self._api_client: httpx.AsyncClient | None = None
-        self._html_client: httpx.AsyncClient | None = None
+        self._api_client: AsyncSession | None = None
+        self._html_client: AsyncSession | None = None
         self._html_request_count: int = 0
         self.search_url = "https://so.szlcsc.com/global.html"
         self.api_search_url = "https://wmsc.lcsc.com/ftps/wm/search/global"
@@ -86,15 +85,16 @@ class LcscAdapter(BaseSupplierAdapter):
         return await self._search(sku, SearchType.SKU)
 
     async def _search(self, query: str, search_type: SearchType) -> PartResult:
+        query = self._prepare_query(query)
         if not query:
             return self.not_found_result(query, search_type)
-        if self._contains_chinese(query):
+        if self._is_pure_chinese(query):
             return PartResult(
                 supplier=self.supplier_name,
                 query=query,
                 search_type=search_type,
                 status=QueryStatus.NOT_FOUND,
-                error_message="Skipped non-MPN keyword containing Chinese characters",
+                error_message="Skipped non-MPN keyword (pure Chinese or empty after stripping annotations)",
             )
 
         payload: dict[str, Any] | None = None
@@ -420,6 +420,26 @@ class LcscAdapter(BaseSupplierAdapter):
 
     # ── Primitive helpers ─────────────────────────────────────────
 
+    _BRACKET_ANNOTATION = re.compile(r"[（(][^）)]*[）)]")
+
+    def _prepare_query(self, query: str) -> str:
+        """Strip whitespace and Chinese bracket annotations like （云汉）."""
+        cleaned = query.strip()
+        if not cleaned:
+            return ""
+        # Strip Chinese bracket annotations (e.g. "XC7Z020（云汉）" → "XC7Z020")
+        cleaned = self._BRACKET_ANNOTATION.sub("", cleaned).strip()
+        return cleaned
+
+    def _is_pure_chinese(self, text: str) -> bool:
+        """True if the text contains only Chinese characters and whitespace."""
+        if not text:
+            return False
+        stripped = text.strip()
+        if not stripped:
+            return False
+        return bool(re.fullmatch(r"[一-鿿\s]+", stripped))
+
     def _first(self, item: dict[str, Any], *keys: str) -> Any:
         for key in keys:
             value = item.get(key)
@@ -516,8 +536,12 @@ class LcscAdapter(BaseSupplierAdapter):
             if char not in {" ", "-", "_", "/", "\\", "."}
         )
 
-    def _contains_chinese(self, value: Any) -> bool:
-        return bool(re.search(r"[\u4e00-\u9fff]", str(value)))
+    def _is_pure_chinese(self, value: Any) -> bool:
+        """True if the text contains only Chinese characters and whitespace."""
+        text = str(value).strip()
+        if not text:
+            return False
+        return bool(re.fullmatch(r"[\u4e00-\u9fff\s]+", text))
 
     def _is_login_or_rate_limit_page(self, title: str, body: str) -> bool:
         text = f"{title}\n{body[:1000]}".lower()
@@ -525,33 +549,33 @@ class LcscAdapter(BaseSupplierAdapter):
 
     # ── Client lifecycle ──────────────────────────────────────────
 
-    def _get_api_client(self, headers: dict[str, str]) -> httpx.AsyncClient:
+    def _get_api_client(self, headers: dict[str, str]) -> AsyncSession:
         if self._api_client is None:
-            self._api_client = httpx.AsyncClient(
+            self._api_client = AsyncSession(
+                impersonate="chrome124",
                 timeout=self.timeout,
                 headers=headers,
-                http2=self.http2,
-                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
             )
         return self._api_client
 
-    def _get_html_client(self) -> httpx.AsyncClient:
-        """Get or create the persistent HTTP/1.1 keep-alive client for HTML searches."""
+    def _get_html_client(self) -> AsyncSession:
+        """Get or create the impersonated browser session for HTML searches.
+
+        Uses curl_cffi's Chrome 124 TLS fingerprint to bypass Akamai challenges.
+        """
         if self._html_client is None:
-            self._html_client = httpx.AsyncClient(
+            self._html_client = AsyncSession(
+                impersonate="chrome124",
                 timeout=self.timeout,
                 headers=_HTML_HEADERS,
-                http2=False,
-                follow_redirects=True,
-                limits=httpx.Limits(max_connections=3, max_keepalive_connections=3),
             )
         return self._html_client
 
-    async def _do_http_get(self, client: httpx.AsyncClient, query: str) -> httpx.Response:
+    async def _do_http_get(self, client: AsyncSession, query: str) -> Any:
         """Perform HTTP GET with transport error recovery."""
         try:
             return await client.get(self.search_url, params={"k": query})
-        except (httpx.RemoteProtocolError, httpx.ConnectError):
+        except CurlError:
             # Connection dropped — rotate and retry once
             await self._recreate_html_client()
             new_client = self._get_html_client()
@@ -560,14 +584,14 @@ class LcscAdapter(BaseSupplierAdapter):
     async def _recreate_html_client(self) -> None:
         """Close and recreate the HTML client (connection rotation)."""
         if self._html_client is not None:
-            await self._html_client.aclose()
+            await self._html_client.close()
         self._html_client = None
         self._html_request_count = 0
 
     async def close(self) -> None:
         if self._api_client is not None:
-            await self._api_client.aclose()
+            await self._api_client.close()
         self._api_client = None
         if self._html_client is not None:
-            await self._html_client.aclose()
+            await self._html_client.close()
         self._html_client = None

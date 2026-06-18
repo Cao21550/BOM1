@@ -14,3 +14,4 @@ _pytest_tmp_run/
 samples/*_completed*
 samples/output*
 samples/*_query_tasks.csv
+.claude/

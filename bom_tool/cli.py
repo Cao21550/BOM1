@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument(
         "--supplier",
         action="append",
-        help="Supplier adapter name; repeatable. Supported: lcsc, hqchip, mouser. Defaults to lcsc",
+        help="Supplier adapter name; repeatable. Supported: lcsc, hqchip. Defaults to lcsc",
     )
     parser.add_argument("--sheet", default=None, help="Excel sheet name")
     parser.add_argument("--max-concurrent", type=int, default=1)

@@ -34,7 +34,6 @@ DEFAULT_CACHE_PATH = Path(".cache") / "bom_cache.sqlite3"
 SUPPLIER_LABELS = {
     "lcsc": "立创商城",
     "hqchip": "华秋商城",
-    "mouser": "贸泽",
     "mock": "模拟商城",
 }
 

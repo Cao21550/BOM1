@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from bom_tool.adapters.base_adapter import BaseSupplierAdapter
 from bom_tool.adapters.registry import SUPPLIER_CHOICES, create_adapters
 from bom_tool.core.bom_pipeline import (
     DEFAULT_CACHE_PATH,
@@ -42,12 +43,11 @@ from bom_tool.core.bom_pipeline import (
 from bom_tool.core.file_parser import FilePreview, read_preview
 from bom_tool.core.task_manager import TaskProgress
 from bom_tool.db.cache_db import CacheDB
-from bom_tool.models import PartResult, SearchType
+from bom_tool.models import PartResult, QueryStatus, SearchType
 
 SUPPLIER_STATUS_HEADERS = {
     "lcsc": ("立创商城_状态", "立创商城_查询关键字", "立创商城_错误信息"),
     "hqchip": ("华秋商城_状态", "华秋商城_查询关键字", "华秋商城_错误信息"),
-    "mouser": ("贸泽_状态", "贸泽_查询关键字", "贸泽_错误信息"),
 }
 
 SEARCH_HEADER_PRIORITIES = (
@@ -218,12 +218,22 @@ class PipelineWorker(QObject):
 class SingleQueryWorker(QObject):
     finished = Signal(bool, object, str)
 
-    def __init__(self, keyword: str, search_type: SearchType, supplier_names: list[str], lcsc_interval: float = 1.2) -> None:
+    def __init__(
+        self,
+        keyword: str,
+        search_type: SearchType,
+        supplier_names: list[str],
+        lcsc_interval: float = 1.2,
+        enable_cache: bool = True,
+        cache_ttl_hours: int = DEFAULT_CACHE_TTL_HOURS,
+    ) -> None:
         super().__init__()
         self.keyword = keyword
         self.search_type = search_type
         self.supplier_names = supplier_names
         self.lcsc_interval = lcsc_interval
+        self.enable_cache = enable_cache
+        self.cache_ttl_hours = cache_ttl_hours
 
     @Slot()
     def run(self) -> None:
@@ -235,16 +245,50 @@ class SingleQueryWorker(QObject):
         self.finished.emit(True, results, "查询完成")
 
     async def _run_query(self) -> list[PartResult]:
+        cache_db = CacheDB(DEFAULT_CACHE_PATH) if self.enable_cache else None
         adapters = create_adapters(self.supplier_names, lcsc_interval=self.lcsc_interval)
+
         try:
-            tasks = [
-                adapter.search_by_sku(self.keyword)
-                if self.search_type == SearchType.SKU
-                else adapter.search_by_mpn(self.keyword)
-                for adapter in adapters
-            ]
-            return list(await asyncio.gather(*tasks))
+            results: list[PartResult] = []
+            network_tasks: list[tuple[BaseSupplierAdapter, int]] = []
+
+            for idx, adapter in enumerate(adapters):
+                query = self.keyword
+                st = self.search_type
+
+                if cache_db is not None:
+                    cached = cache_db.get(adapter.cache_key, st, query, self.cache_ttl_hours)
+                    if cached is not None:
+                        results.append(PartResult.from_dict(cached))
+                        continue
+
+                network_tasks.append((adapter, idx))
+                results.append(None)  # placeholder
+
+            if network_tasks:
+                coros = []
+                for adapter, idx in network_tasks:
+                    if self.search_type == SearchType.SKU:
+                        coros.append(adapter.search_by_sku(self.keyword))
+                    else:
+                        coros.append(adapter.search_by_mpn(self.keyword))
+
+                network_results = list(await asyncio.gather(*coros))
+
+                for (adapter, idx), result in zip(network_tasks, network_results):
+                    results[idx] = result
+                    if cache_db is not None and result.status != QueryStatus.FAILED:
+                        cache_db.set(
+                            adapter.cache_key,
+                            self.search_type,
+                            self.keyword,
+                            result.to_dict(),
+                        )
+
+            return results
         finally:
+            if cache_db is not None:
+                cache_db.close()
             for adapter in adapters:
                 close = getattr(adapter, "close", None)
                 if close:
@@ -395,7 +439,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(form_group)
 
         self.single_supplier_checks = self._build_supplier_checks(
-            defaults={"lcsc", "hqchip", "mouser"}
+            defaults={"lcsc", "hqchip"}
         )
         layout.addWidget(self.single_supplier_checks["group"])
 
@@ -672,6 +716,8 @@ class MainWindow(QMainWindow):
             SearchType(self.single_search_type_combo.currentData()),
             self._selected_suppliers(self.single_supplier_checks),
             lcsc_interval=0.8,
+            enable_cache=self.cache_check.isChecked(),
+            cache_ttl_hours=self.cache_ttl_spin.value(),
         )
         self.single_worker.moveToThread(self.single_thread)
         self.single_thread.started.connect(self.single_worker.run)
