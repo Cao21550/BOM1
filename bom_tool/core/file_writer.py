@@ -26,7 +26,7 @@ def fill_xlsx_data(
     workbook = load_workbook(original_path)
     try:
         worksheet = workbook[sheet_name] if sheet_name else workbook[workbook.sheetnames[0]]
-        start_col = worksheet.max_column + 1
+        start_col = _last_value_column(worksheet) + 1
 
         source_col = max(1, start_col - 1)
         source_width = worksheet.column_dimensions[get_column_letter(source_col)].width
@@ -128,6 +128,14 @@ def _read_csv_rows(path: Path) -> list[list[str]]:
     if last_error is not None:
         raise last_error
     raise ValueError("CSV file could not be read")
+
+
+def _last_value_column(worksheet: Any) -> int:
+    last_column = 0
+    for cell in getattr(worksheet, "_cells", {}).values():
+        if cell.value is not None:
+            last_column = max(last_column, cell.column)
+    return last_column
 
 
 def _copy_cell_style(source: Any, target: Any) -> None:

@@ -41,6 +41,35 @@ def test_fill_xlsx_data_copies_neighbor_styles_and_serializes_complex_values(
     assert sheet["C2"].value == '[{"quantity": 1, "unit_price": 8.5}]'
 
 
+
+def test_fill_xlsx_data_appends_after_last_value_column_not_styled_blank_cells(
+    workspace_tmp_path: Path,
+) -> None:
+    input_path = workspace_tmp_path / "input_with_styled_blank.xlsx"
+    output_path = workspace_tmp_path / "output_with_styled_blank.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(["mpn", "qty"])
+    worksheet.append(["ABC", 1])
+    worksheet["Z1"].fill = PatternFill("solid", fgColor="366092")
+    workbook.save(input_path)
+
+    fill_xlsx_data(
+        input_path,
+        output_path,
+        {2: {"status": "success"}},
+        ["status"],
+        preserve_styles=False,
+    )
+
+    exported = load_workbook(output_path)
+    sheet = exported.active
+
+    assert sheet["C1"].value == "status"
+    assert sheet["C2"].value == "success"
+    assert sheet["Z1"].value is None
+
 def test_fill_xlsx_data_rejects_overwriting_input(workspace_tmp_path: Path) -> None:
     input_path = workspace_tmp_path / "input.xlsx"
 

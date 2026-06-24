@@ -4,7 +4,14 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from bom_tool.adapters.mock_adapter import MockSupplierAdapter
-from bom_tool.core.bom_pipeline import BomPipeline, BomPipelineConfig, write_query_task_table
+from bom_tool.core.bom_pipeline import (
+    DEFAULT_OUTPUT_FIELDS,
+    FIELD_LABELS,
+    SUPPLIER_LABELS,
+    BomPipeline,
+    BomPipelineConfig,
+    write_query_task_table,
+)
 from bom_tool.core.file_parser import read_preview
 from bom_tool.db.cache_db import CacheDB
 from bom_tool.models import SearchType
@@ -79,7 +86,7 @@ async def test_pipeline_detects_header_row_and_writes_result_headers_there(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_default_headers_are_chinese_without_price_breaks_or_lead_time(
+async def test_pipeline_default_headers_follow_supplier_output_order(
     workspace_tmp_path: Path,
 ) -> None:
     input_path = workspace_tmp_path / "input_default_fields.xlsx"
@@ -104,14 +111,53 @@ async def test_pipeline_default_headers_are_chinese_without_price_breaks_or_lead
 
     exported = load_workbook(output_path)
     headers = [cell.value for cell in exported.active[1]]
+    expected_headers = [
+        f"{SUPPLIER_LABELS['mock']}_{FIELD_LABELS[field_name]}"
+        for field_name in DEFAULT_OUTPUT_FIELDS
+    ]
 
-    assert "模拟商城_查询关键字" in headers
-    assert "模拟商城_状态" in headers
-    assert "模拟商城_库存" in headers
-    assert "模拟商城_阶梯价" not in headers
-    assert "模拟商城_交期" not in headers
-    assert all(not str(header).startswith("mock_") for header in headers if header)
+    assert headers[1:] == expected_headers
+    assert DEFAULT_OUTPUT_FIELDS == [
+        "status",
+        "query",
+        "mpn",
+        "sku",
+        "brand",
+        "package",
+        "description",
+    ]
 
+@pytest.mark.asyncio
+async def test_pipeline_skips_non_mpn_category_rows(workspace_tmp_path: Path) -> None:
+    input_path = workspace_tmp_path / "input_with_category.xlsx"
+    output_path = workspace_tmp_path / "output_with_category.xlsx"
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(["item", "part number"])
+    worksheet.append(["Group", "芯片"])
+    worksheet.append([1, "ABC-CT"])
+    workbook.save(input_path)
+
+    pipeline = BomPipeline([MockSupplierAdapter()])
+    result = await pipeline.run(
+        BomPipelineConfig(
+            input_path=input_path,
+            output_path=output_path,
+            search_column="part number",
+            output_fields=["status", "mpn"],
+            enable_cache=False,
+        )
+    )
+
+    exported = load_workbook(output_path)
+    exported_sheet = exported.active
+
+    assert result.total_rows == 1
+    assert exported_sheet.cell(row=2, column=3).value is None
+    assert exported_sheet.cell(row=2, column=4).value is None
+    assert exported_sheet.cell(row=3, column=3).value == "success"
+    assert exported_sheet.cell(row=3, column=4).value == "ABC"
 
 def test_pipeline_precheck_reports_cache_hits_and_writes_task_table(
     workspace_tmp_path: Path,

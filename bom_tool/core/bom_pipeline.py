@@ -13,20 +13,13 @@ from bom_tool.db.cache_db import CacheDB
 from bom_tool.models import PartResult, QueryStatus, SearchType
 
 DEFAULT_OUTPUT_FIELDS = [
-    "query",
-    "search_type",
     "status",
+    "query",
     "mpn",
     "sku",
     "brand",
     "package",
-    "stock",
-    "moq",
-    "price_unit",
     "description",
-    "product_url",
-    "datasheet_url",
-    "error_message",
 ]
 DEFAULT_CACHE_TTL_HOURS = 24 * 7
 DEFAULT_CACHE_PATH = Path(".cache") / "bom_cache.sqlite3"
@@ -144,8 +137,13 @@ class BomPipeline:
                 cache=cache,
                 cache_ttl_hours=config.cache_ttl_hours,
             )
+            query_rows = [
+                row
+                for row in search_rows
+                if manager._resolve_keyword(row.keyword, config.search_type)[0]
+            ]
             keyword_results = await manager.process_bom(
-                [row.keyword for row in search_rows],
+                [row.keyword for row in query_rows],
                 config.search_type,
                 progress_callback,
                 retry_failed=config.retry_failed,
@@ -155,7 +153,7 @@ class BomPipeline:
                 cache.close()
 
         row_results, exported_fields = self._build_row_results(
-            search_rows,
+            query_rows,
             keyword_results,
             output_fields,
         )
@@ -163,7 +161,7 @@ class BomPipeline:
 
         return BomPipelineResult(
             output_path=output_path,
-            total_rows=len(search_rows),
+            total_rows=len(query_rows),
             exported_fields=exported_fields,
             row_results=row_results,
         )
